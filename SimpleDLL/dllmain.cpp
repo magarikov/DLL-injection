@@ -11,7 +11,7 @@ void my_func() {
 
     WCHAR text[64] = L"hello world";
     MessageBox(NULL, text, L"my func", MB_ICONINFORMATION);
-    Beep(10000, 1000);
+    Beep(1000, 1000);
     return;
 }
 
