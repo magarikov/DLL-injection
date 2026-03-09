@@ -300,7 +300,7 @@ BOOL APIENTRY DllMain( HMODULE hModule, DWORD  reason, LPVOID lpReserved)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH: {
-        //fopen_s(&file, "C:/Users/magar/source/repos/SimpleDLL/x64/Release/log.txt", "a+");
+        //52
         Sleep(3000);
         connect_to_server();
 
