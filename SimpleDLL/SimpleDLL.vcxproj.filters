@@ -33,4 +33,9 @@
       <Filter>Исходные файлы</Filter>
     </ClCompile>
   </ItemGroup>
+  <ItemGroup>
+    <MASM Include="callLogger.asm">
+      <Filter>Исходные файлы</Filter>
+    </MASM>
+  </ItemGroup>
 </Project>

